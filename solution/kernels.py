@@ -75,7 +75,7 @@ _orig_rms = None
 # ------------------------------------------------------------------ RoPE
 # q_e = q*cos + rotate_half(q)*sin, rotate_half(x) = cat(-x2, x1). Обратное: поворот на -угол.
 @triton.jit
-def _rope(X, COS, SIN, Y, H, S, D, sxb, sxh, sxs, SIGN: tl.constexpr, BLOCK: tl.constexpr):
+def _rope(X, COS, SIN, Y, H, S, D, CB, sxb, sxh, sxs, SIGN: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0)            # индекс (b, h, s)
     s = row % S
     bh = row // S
@@ -87,7 +87,7 @@ def _rope(X, COS, SIN, Y, H, S, D, sxb, sxh, sxs, SIGN: tl.constexpr, BLOCK: tl.
     base = b * sxb + h * sxh + s * sxs
     x1 = tl.load(X + base + cols, mask=mask, other=0.0).to(tl.float32)
     x2 = tl.load(X + base + half + cols, mask=mask, other=0.0).to(tl.float32)
-    cb = (b * S + s) * D
+    cb = ((b % CB) * S + s) * D
     c1 = tl.load(COS + cb + cols, mask=mask, other=0.0).to(tl.float32)
     c2 = tl.load(COS + cb + half + cols, mask=mask, other=0.0).to(tl.float32)
     s1 = tl.load(SIN + cb + cols, mask=mask, other=0.0).to(tl.float32)
@@ -107,7 +107,7 @@ def _launch_rope(x, cos, sin, sign):
     B, H, S, D = x.shape
     y = torch.empty((B, H, S, D), dtype=x.dtype, device=x.device)
     BLOCK = triton.next_power_of_2(D // 2)
-    _rope[(B * H * S,)](x, cos, sin, y, H, S, D, x.stride(0), x.stride(1), x.stride(2),
+    _rope[(B * H * S,)](x, cos, sin, y, H, S, D, cos.shape[0], x.stride(0), x.stride(1), x.stride(2),
                         SIGN=sign, BLOCK=BLOCK)
     return y
 
@@ -124,11 +124,14 @@ class RopeFn(torch.autograd.Function):
         return _launch_rope(dy.contiguous(), cos, sin, -1), None, None
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    # поддерживаем только типичный случай Qwen2: q,k (B,H,S,D), cos/sin (B,S,D)
-    if (unsqueeze_dim != 1 or not q.is_cuda or cos.dim() != 3 or cos.shape[0] != q.shape[0]
-            or q.shape[-1] % 2 != 0):
-        return _orig_rope(q, k, cos, sin, position_ids, unsqueeze_dim)
+def apply_rotary_pos_emb(q, k, cos, sin, *args, **kwargs):
+    # быстрый путь: q,k (B,H,S,D), cos/sin (B или 1, S, D), unsqueeze_dim=1; иначе оригинал
+    unsq = kwargs.get("unsqueeze_dim", args[-1] if args else 1)
+    ok = (unsq == 1 and q.is_cuda and q.dim() == 4 and k.dim() == 4 and cos.dim() == 3
+          and cos.shape == sin.shape and cos.shape[1] == q.shape[2] and cos.shape[2] == q.shape[3]
+          and cos.shape[0] in (1, q.shape[0]) and q.shape[-1] % 2 == 0)
+    if not ok:
+        return _orig_rope(q, k, cos, sin, *args, **kwargs)
     cos = cos.contiguous()
     sin = sin.contiguous()
     return RopeFn.apply(q, cos, sin), RopeFn.apply(k, cos, sin)
