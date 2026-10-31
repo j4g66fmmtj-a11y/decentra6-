@@ -49,3 +49,17 @@ def test_rope():
     torch.testing.assert_close(oq, rq, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(ok, rk, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(q2.grad, q.grad, rtol=2e-2, atol=2e-2)
+
+
+def test_log_softmax():
+    from solution.logsoftmax import LogSoftmaxFn
+    torch.manual_seed(0)
+    x = torch.randn(64, 151936, device="cuda", dtype=torch.float32, requires_grad=True)
+    x2 = x.detach().clone().requires_grad_()
+    dy = torch.randn_like(x)
+    r = torch.log_softmax(x, -1)
+    o = LogSoftmaxFn.apply(x2)
+    r.backward(dy)
+    o.backward(dy)
+    torch.testing.assert_close(o, r, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(x2.grad, x.grad, rtol=1e-3, atol=1e-4)
